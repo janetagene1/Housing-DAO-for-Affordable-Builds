@@ -7,8 +7,15 @@
 (define-constant ERR_MILESTONE_NOT_FOUND u105)
 (define-constant ERR_ALREADY_VERIFIED u106)
 (define-constant ERR_INVALID_MILESTONE u107)
+(define-constant ERR_LOW_REPUTATION u108)
 (define-constant VOTING_PERIOD u1008)
 (define-constant MIN_PROPOSAL_THRESHOLD u1000000)
+(define-constant BASE_REPUTATION_SCORE u1000)
+(define-constant VOTE_PARTICIPATION_BONUS u10)
+(define-constant PROPOSAL_APPROVED_BONUS u50)
+(define-constant PROPOSAL_REJECTED_PENALTY u25)
+(define-constant VERIFICATION_ACCURACY_BONUS u20)
+(define-constant MIN_REPUTATION_FOR_PROPOSALS u800)
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-project-id uint u1)
@@ -16,6 +23,13 @@
 
 (define-map dao-members principal uint)
 (define-map member-contributions principal uint)
+(define-map member-reputation principal {
+    score: uint,
+    total-votes: uint,
+    successful-proposals: uint,
+    failed-proposals: uint,
+    verifications-made: uint
+})
 
 (define-map proposals uint {
     id: uint,
@@ -63,13 +77,24 @@
         (map-set dao-members tx-sender (+ current-member u1))
         (map-set member-contributions tx-sender (+ current-contribution contribution))
         (var-set total-dao-fund (+ (var-get total-dao-fund) contribution))
+        (if (is-none (map-get? member-reputation tx-sender))
+            (map-set member-reputation tx-sender {
+                score: BASE_REPUTATION_SCORE,
+                total-votes: u0,
+                successful-proposals: u0,
+                failed-proposals: u0,
+                verifications-made: u0
+            })
+            true)
         (ok true)))
 
 (define-public (create-proposal (title (string-ascii 100)) (description (string-ascii 500)) 
                                (project-type (string-ascii 50)) (requested-amount uint))
     (let ((proposal-id (var-get next-proposal-id))
-          (member-status (default-to u0 (map-get? dao-members tx-sender))))
+          (member-status (default-to u0 (map-get? dao-members tx-sender)))
+          (member-rep (unwrap! (map-get? member-reputation tx-sender) (err ERR_NOT_AUTHORIZED))))
         (asserts! (> member-status u0) (err ERR_NOT_AUTHORIZED))
+        (asserts! (>= (get score member-rep) MIN_REPUTATION_FOR_PROPOSALS) (err ERR_LOW_REPUTATION))
         (asserts! (>= requested-amount MIN_PROPOSAL_THRESHOLD) (err ERR_INVALID_PROPOSAL))
         (asserts! (<= requested-amount (var-get total-dao-fund)) (err ERR_INSUFFICIENT_FUNDS))
         (map-set proposals proposal-id {
@@ -91,27 +116,45 @@
 (define-public (vote-on-proposal (proposal-id uint) (vote-for bool))
     (let ((proposal (unwrap! (map-get? proposals proposal-id) (err ERR_INVALID_PROPOSAL)))
           (member-status (default-to u0 (map-get? dao-members tx-sender)))
-          (vote-key {proposal-id: proposal-id, voter: tx-sender}))
+          (vote-key {proposal-id: proposal-id, voter: tx-sender})
+          (voter-rep (unwrap! (map-get? member-reputation tx-sender) (err ERR_NOT_AUTHORIZED)))
+          (reputation-weight (if (> (get score voter-rep) u100) (/ (get score voter-rep) u100) u1)))
         (asserts! (> member-status u0) (err ERR_NOT_AUTHORIZED))
         (asserts! (< stacks-block-height (get end-block proposal)) (err ERR_PROPOSAL_NOT_ACTIVE))
         (asserts! (is-none (map-get? proposal-votes vote-key)) (err ERR_ALREADY_VOTED))
         (map-set proposal-votes vote-key vote-for)
+        (map-set member-reputation tx-sender (merge voter-rep {
+            total-votes: (+ (get total-votes voter-rep) u1),
+            score: (+ (get score voter-rep) VOTE_PARTICIPATION_BONUS)
+        }))
         (if vote-for
-            (map-set proposals proposal-id (merge proposal {votes-for: (+ (get votes-for proposal) u1)}))
-            (map-set proposals proposal-id (merge proposal {votes-against: (+ (get votes-against proposal) u1)})))
+            (map-set proposals proposal-id (merge proposal {votes-for: (+ (get votes-for proposal) reputation-weight)}))
+            (map-set proposals proposal-id (merge proposal {votes-against: (+ (get votes-against proposal) reputation-weight)})))
         (ok true)))
 
 (define-public (execute-proposal (proposal-id uint))
-    (let ((proposal (unwrap! (map-get? proposals proposal-id) (err ERR_INVALID_PROPOSAL))))
+    (let ((proposal (unwrap! (map-get? proposals proposal-id) (err ERR_INVALID_PROPOSAL)))
+          (proposer-rep (unwrap! (map-get? member-reputation (get proposer proposal)) (err ERR_INVALID_PROPOSAL))))
         (asserts! (>= stacks-block-height (get end-block proposal)) (err ERR_PROPOSAL_NOT_ACTIVE))
         (asserts! (not (get executed proposal)) (err ERR_INVALID_PROPOSAL))
         (let ((approved (> (get votes-for proposal) (get votes-against proposal))))
             (map-set proposals proposal-id (merge proposal {executed: true, approved: approved}))
             (if approved
                 (begin
+                    (map-set member-reputation (get proposer proposal) (merge proposer-rep {
+                        successful-proposals: (+ (get successful-proposals proposer-rep) u1),
+                        score: (+ (get score proposer-rep) PROPOSAL_APPROVED_BONUS)
+                    }))
                     (var-set total-dao-fund (- (var-get total-dao-fund) (get requested-amount proposal)))
                     (ok true))
-                (ok false)))))
+                (begin
+                    (map-set member-reputation (get proposer proposal) (merge proposer-rep {
+                        failed-proposals: (+ (get failed-proposals proposer-rep) u1),
+                        score: (if (> (get score proposer-rep) PROPOSAL_REJECTED_PENALTY) 
+                                  (- (get score proposer-rep) PROPOSAL_REJECTED_PENALTY) 
+                                  u0)
+                    }))
+                    (ok false))))))
 
 (define-public (create-housing-project (proposal-id uint) (name (string-ascii 100)) 
                                       (location (string-ascii 200)) (contractor principal))
@@ -153,13 +196,18 @@
     (let ((project (unwrap! (map-get? housing-projects project-id) (err ERR_INVALID_PROPOSAL)))
           (milestone-key {project-id: project-id, milestone-id: milestone-id})
           (milestone (unwrap! (map-get? project-milestones milestone-key) (err ERR_MILESTONE_NOT_FOUND)))
-          (member-status (default-to u0 (map-get? dao-members tx-sender))))
+          (member-status (default-to u0 (map-get? dao-members tx-sender)))
+          (verifier-rep (unwrap! (map-get? member-reputation tx-sender) (err ERR_NOT_AUTHORIZED))))
         (asserts! (> member-status u0) (err ERR_NOT_AUTHORIZED))
         (asserts! (not (get verified milestone)) (err ERR_ALREADY_VERIFIED))
         (map-set project-milestones milestone-key (merge milestone {
             verified: true,
             verifier: (some tx-sender),
             completed-at: (some stacks-block-height)
+        }))
+        (map-set member-reputation tx-sender (merge verifier-rep {
+            verifications-made: (+ (get verifications-made verifier-rep) u1),
+            score: (+ (get score verifier-rep) VERIFICATION_ACCURACY_BONUS)
         }))
         (ok true)))
 
@@ -206,3 +254,14 @@
 
 (define-read-only (get-next-project-id)
     (ok (var-get next-project-id)))
+
+(define-read-only (get-member-reputation (member principal))
+    (ok (map-get? member-reputation member)))
+
+(define-read-only (get-reputation-score (member principal))
+    (let ((reputation (map-get? member-reputation member)))
+        (ok (if (is-some reputation) (get score (unwrap-panic reputation)) u0))))
+
+(define-read-only (get-voting-weight (member principal))
+    (let ((reputation (default-to {score: u0, total-votes: u0, successful-proposals: u0, failed-proposals: u0, verifications-made: u0} (map-get? member-reputation member))))
+        (ok (if (> (get score reputation) u100) (/ (get score reputation) u100) u1))))
