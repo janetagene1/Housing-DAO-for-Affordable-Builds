@@ -16,10 +16,18 @@
 (define-constant PROPOSAL_REJECTED_PENALTY u25)
 (define-constant VERIFICATION_ACCURACY_BONUS u20)
 (define-constant MIN_REPUTATION_FOR_PROPOSALS u800)
+(define-constant ERR_DISPUTE_NOT_FOUND u109)
+(define-constant ERR_DISPUTE_RESOLVED u110)
+(define-constant ERR_CANNOT_DISPUTE_OWN u111)
+(define-constant ERR_DISPUTE_PERIOD_ENDED u112)
+(define-constant DISPUTE_VOTING_PERIOD u504)
+(define-constant MIN_REPUTATION_FOR_DISPUTES u500)
+(define-constant DISPUTE_FILING_COST u10000)
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-project-id uint u1)
 (define-data-var total-dao-fund uint u0)
+(define-data-var next-dispute-id uint u1)
 
 (define-map dao-members principal uint)
 (define-map member-contributions principal uint)
@@ -68,6 +76,24 @@
 })
 
 (define-map milestone-counter uint uint)
+
+(define-map disputes uint {
+    id: uint,
+    disputer: principal,
+    disputed-party: principal,
+    project-id: uint,
+    milestone-id: uint,
+    reason: (string-ascii 300),
+    evidence: (string-ascii 500),
+    votes-for: uint,
+    votes-against: uint,
+    end-block: uint,
+    resolved: bool,
+    ruling: (optional bool),
+    created-at: uint
+})
+
+(define-map dispute-votes {dispute-id: uint, voter: principal} bool)
 
 (define-public (join-dao (contribution uint))
     (let ((current-member (default-to u0 (map-get? dao-members tx-sender)))
@@ -265,3 +291,86 @@
 (define-read-only (get-voting-weight (member principal))
     (let ((reputation (default-to {score: u0, total-votes: u0, successful-proposals: u0, failed-proposals: u0, verifications-made: u0} (map-get? member-reputation member))))
         (ok (if (> (get score reputation) u100) (/ (get score reputation) u100) u1))))
+
+(define-public (file-dispute (disputed-party principal) (project-id uint) (milestone-id uint) 
+                           (reason (string-ascii 300)) (evidence (string-ascii 500)))
+    (let ((dispute-id (var-get next-dispute-id))
+          (disputer-rep (unwrap! (map-get? member-reputation tx-sender) (err ERR_NOT_AUTHORIZED)))
+          (member-status (default-to u0 (map-get? dao-members tx-sender)))
+          (milestone-key {project-id: project-id, milestone-id: milestone-id})
+          (milestone (unwrap! (map-get? project-milestones milestone-key) (err ERR_MILESTONE_NOT_FOUND))))
+        (asserts! (> member-status u0) (err ERR_NOT_AUTHORIZED))
+        (asserts! (>= (get score disputer-rep) MIN_REPUTATION_FOR_DISPUTES) (err ERR_LOW_REPUTATION))
+        (asserts! (not (is-eq tx-sender disputed-party)) (err ERR_CANNOT_DISPUTE_OWN))
+        (asserts! (get verified milestone) (err ERR_INVALID_MILESTONE))
+        (try! (stx-transfer? DISPUTE_FILING_COST tx-sender (as-contract tx-sender)))
+        (map-set disputes dispute-id {
+            id: dispute-id,
+            disputer: tx-sender,
+            disputed-party: disputed-party,
+            project-id: project-id,
+            milestone-id: milestone-id,
+            reason: reason,
+            evidence: evidence,
+            votes-for: u0,
+            votes-against: u0,
+            end-block: (+ stacks-block-height DISPUTE_VOTING_PERIOD),
+            resolved: false,
+            ruling: none,
+            created-at: stacks-block-height
+        })
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)))
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-for bool))
+    (let ((dispute (unwrap! (map-get? disputes dispute-id) (err ERR_DISPUTE_NOT_FOUND)))
+          (member-status (default-to u0 (map-get? dao-members tx-sender)))
+          (vote-key {dispute-id: dispute-id, voter: tx-sender})
+          (voter-rep (unwrap! (map-get? member-reputation tx-sender) (err ERR_NOT_AUTHORIZED)))
+          (reputation-weight (if (> (get score voter-rep) u100) (/ (get score voter-rep) u100) u1)))
+        (asserts! (> member-status u0) (err ERR_NOT_AUTHORIZED))
+        (asserts! (< stacks-block-height (get end-block dispute)) (err ERR_DISPUTE_PERIOD_ENDED))
+        (asserts! (not (get resolved dispute)) (err ERR_DISPUTE_RESOLVED))
+        (asserts! (is-none (map-get? dispute-votes vote-key)) (err ERR_ALREADY_VOTED))
+        (asserts! (not (is-eq tx-sender (get disputer dispute))) (err ERR_NOT_AUTHORIZED))
+        (asserts! (not (is-eq tx-sender (get disputed-party dispute))) (err ERR_NOT_AUTHORIZED))
+        (map-set dispute-votes vote-key vote-for)
+        (if vote-for
+            (map-set disputes dispute-id (merge dispute {votes-for: (+ (get votes-for dispute) reputation-weight)}))
+            (map-set disputes dispute-id (merge dispute {votes-against: (+ (get votes-against dispute) reputation-weight)})))
+        (ok true)))
+
+(define-public (resolve-dispute (dispute-id uint))
+    (let ((dispute (unwrap! (map-get? disputes dispute-id) (err ERR_DISPUTE_NOT_FOUND)))
+          (disputed-party-rep (unwrap! (map-get? member-reputation (get disputed-party dispute)) (err ERR_NOT_AUTHORIZED)))
+          (disputer-rep (unwrap! (map-get? member-reputation (get disputer dispute)) (err ERR_NOT_AUTHORIZED))))
+        (asserts! (>= stacks-block-height (get end-block dispute)) (err ERR_DISPUTE_PERIOD_ENDED))
+        (asserts! (not (get resolved dispute)) (err ERR_DISPUTE_RESOLVED))
+        (let ((dispute-upheld (> (get votes-for dispute) (get votes-against dispute))))
+            (map-set disputes dispute-id (merge dispute {resolved: true, ruling: (some dispute-upheld)}))
+            (if dispute-upheld
+                (begin
+                    (map-set member-reputation (get disputed-party dispute) (merge disputed-party-rep {
+                        score: (if (> (get score disputed-party-rep) u100) (- (get score disputed-party-rep) u100) u0)
+                    }))
+                    (try! (as-contract (stx-transfer? (/ DISPUTE_FILING_COST u2) tx-sender (get disputer dispute))))
+                    (let ((milestone-key {project-id: (get project-id dispute), milestone-id: (get milestone-id dispute)}))
+                        (map-set project-milestones milestone-key (merge (unwrap-panic (map-get? project-milestones milestone-key)) {
+                            verified: false,
+                            verifier: none
+                        })))
+                    (ok true))
+                (begin
+                    (map-set member-reputation (get disputer dispute) (merge disputer-rep {
+                        score: (if (> (get score disputer-rep) u50) (- (get score disputer-rep) u50) u0)
+                    }))
+                    (ok false))))))
+
+(define-read-only (get-dispute (dispute-id uint))
+    (ok (map-get? disputes dispute-id)))
+
+(define-read-only (get-dispute-vote (dispute-id uint) (voter principal))
+    (ok (map-get? dispute-votes {dispute-id: dispute-id, voter: voter})))
+
+(define-read-only (get-next-dispute-id)
+    (ok (var-get next-dispute-id)))
