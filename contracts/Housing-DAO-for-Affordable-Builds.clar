@@ -20,14 +20,27 @@
 (define-constant ERR_DISPUTE_RESOLVED u110)
 (define-constant ERR_CANNOT_DISPUTE_OWN u111)
 (define-constant ERR_DISPUTE_PERIOD_ENDED u112)
+
+;; Error constants for quality rating system
+(define-constant ERR_PROJECT_NOT_COMPLETED u113)
+(define-constant ERR_ALREADY_RATED u114)
+(define-constant ERR_INVALID_RATING u115)
+(define-constant ERR_RATING_NOT_FOUND u116)
 (define-constant DISPUTE_VOTING_PERIOD u504)
 (define-constant MIN_REPUTATION_FOR_DISPUTES u500)
 (define-constant DISPUTE_FILING_COST u10000)
+
+;; Quality rating system constants
+(define-constant MIN_RATING u1)
+(define-constant MAX_RATING u5)
+(define-constant QUALITY_RATING_REWARD u100)
+(define-constant EXCELLENCE_BONUS u200)
 
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-project-id uint u1)
 (define-data-var total-dao-fund uint u0)
 (define-data-var next-dispute-id uint u1)
+(define-data-var next-rating-id uint u1)
 
 (define-map dao-members principal uint)
 (define-map member-contributions principal uint)
@@ -94,6 +107,29 @@
 })
 
 (define-map dispute-votes {dispute-id: uint, voter: principal} bool)
+
+;; Quality rating system maps
+(define-map quality-ratings uint {
+    id: uint,
+    project-id: uint,
+    rater: principal,
+    contractor: principal,
+    overall-quality: uint,
+    materials-quality: uint,
+    workmanship: uint,
+    timeline-adherence: uint,
+    communication: uint,
+    comments: (string-ascii 300),
+    created-at: uint
+})
+
+(define-map project-ratings {project-id: uint, rater: principal} uint)
+(define-map contractor-ratings principal {
+    total-ratings: uint,
+    average-score: uint,
+    excellence-count: uint,
+    total-projects: uint
+})
 
 (define-public (join-dao (contribution uint))
     (let ((current-member (default-to u0 (map-get? dao-members tx-sender)))
@@ -374,3 +410,115 @@
 
 (define-read-only (get-next-dispute-id)
     (ok (var-get next-dispute-id)))
+
+;; Quality Rating System Functions
+(define-public (rate-project (project-id uint) (overall-quality uint) (materials-quality uint) 
+                           (workmanship uint) (timeline-adherence uint) (communication uint)
+                           (comments (string-ascii 300)))
+    (let ((project (unwrap! (map-get? housing-projects project-id) (err ERR_INVALID_PROPOSAL)))
+          (rating-id (var-get next-rating-id))
+          (member-status (default-to u0 (map-get? dao-members tx-sender)))
+          (rating-key {project-id: project-id, rater: tx-sender}))
+        ;; Validate inputs and permissions
+        (asserts! (> member-status u0) (err ERR_NOT_AUTHORIZED))
+        (asserts! (is-eq (get status project) "completed") (err ERR_PROJECT_NOT_COMPLETED))
+        (asserts! (is-none (map-get? project-ratings rating-key)) (err ERR_ALREADY_RATED))
+        (asserts! (and (>= overall-quality MIN_RATING) (<= overall-quality MAX_RATING)) (err ERR_INVALID_RATING))
+        (asserts! (and (>= materials-quality MIN_RATING) (<= materials-quality MAX_RATING)) (err ERR_INVALID_RATING))
+        (asserts! (and (>= workmanship MIN_RATING) (<= workmanship MAX_RATING)) (err ERR_INVALID_RATING))
+        (asserts! (and (>= timeline-adherence MIN_RATING) (<= timeline-adherence MAX_RATING)) (err ERR_INVALID_RATING))
+        (asserts! (and (>= communication MIN_RATING) (<= communication MAX_RATING)) (err ERR_INVALID_RATING))
+        
+        ;; Calculate average rating
+        (let ((average-rating (/ (+ overall-quality materials-quality workmanship timeline-adherence communication) u5)))
+            ;; Store the rating
+            (map-set quality-ratings rating-id {
+                id: rating-id,
+                project-id: project-id,
+                rater: tx-sender,
+                contractor: (get contractor project),
+                overall-quality: overall-quality,
+                materials-quality: materials-quality,
+                workmanship: workmanship,
+                timeline-adherence: timeline-adherence,
+                communication: communication,
+                comments: comments,
+                created-at: stacks-block-height
+            })
+            
+            ;; Mark project as rated by this user
+            (map-set project-ratings rating-key rating-id)
+            
+            ;; Increment rating ID
+            (var-set next-rating-id (+ rating-id u1))
+            
+            ;; Update contractor rating statistics
+            (let ((contractor (get contractor project))
+                  (current-stats (default-to {total-ratings: u0, average-score: u0, excellence-count: u0, total-projects: u0} 
+                                            (map-get? contractor-ratings contractor))))
+                (let ((new-total-ratings (+ (get total-ratings current-stats) u1))
+                      (new-average (/ (+ (* (get average-score current-stats) (get total-ratings current-stats)) average-rating) 
+                                     new-total-ratings))
+                      (new-excellence-count (if (>= average-rating u5) 
+                                              (+ (get excellence-count current-stats) u1) 
+                                              (get excellence-count current-stats))))
+                    (map-set contractor-ratings contractor {
+                        total-ratings: new-total-ratings,
+                        average-score: new-average,
+                        excellence-count: new-excellence-count,
+                        total-projects: (get total-projects current-stats)
+                    })))
+            
+            ;; Award reputation points to rater
+            (let ((rater-rep (unwrap! (map-get? member-reputation tx-sender) (err ERR_NOT_AUTHORIZED))))
+                (map-set member-reputation tx-sender (merge rater-rep {
+                    score: (+ (get score rater-rep) QUALITY_RATING_REWARD)
+                })))
+            
+            ;; Award excellence bonus to contractor if rating is 5
+            (let ((contractor (get contractor project)))
+                (if (>= average-rating u5)
+                    (let ((contractor-rep (default-to {score: BASE_REPUTATION_SCORE, total-votes: u0, successful-proposals: u0, failed-proposals: u0, verifications-made: u0} 
+                                                     (map-get? member-reputation contractor))))
+                        (map-set member-reputation contractor (merge contractor-rep {
+                            score: (+ (get score contractor-rep) EXCELLENCE_BONUS)
+                        }))
+                        (ok rating-id))
+                    (ok rating-id))))))
+
+(define-public (update-contractor-project-count (contractor principal))
+    (let ((current-stats (default-to {total-ratings: u0, average-score: u0, excellence-count: u0, total-projects: u0} 
+                                   (map-get? contractor-ratings contractor))))
+        (map-set contractor-ratings contractor (merge current-stats {
+            total-projects: (+ (get total-projects current-stats) u1)
+        }))
+        (ok true)))
+
+;; Quality Rating Read-Only Functions
+(define-read-only (get-quality-rating (rating-id uint))
+    (ok (map-get? quality-ratings rating-id)))
+
+(define-read-only (get-project-rating (project-id uint) (rater principal))
+    (ok (map-get? project-ratings {project-id: project-id, rater: rater})))
+
+(define-read-only (get-contractor-ratings (contractor principal))
+    (ok (map-get? contractor-ratings contractor)))
+
+(define-read-only (get-contractor-average-rating (contractor principal))
+    (let ((ratings (map-get? contractor-ratings contractor)))
+        (ok (if (is-some ratings) (get average-score (unwrap-panic ratings)) u0))))
+
+(define-read-only (get-contractor-excellence-rate (contractor principal))
+    (let ((ratings (map-get? contractor-ratings contractor)))
+        (if (is-some ratings)
+            (let ((stats (unwrap-panic ratings)))
+                (if (> (get total-ratings stats) u0)
+                    (ok (/ (* (get excellence-count stats) u100) (get total-ratings stats)))
+                    (ok u0)))
+            (ok u0))))
+
+(define-read-only (get-next-rating-id)
+    (ok (var-get next-rating-id)))
+
+(define-read-only (has-rated-project (project-id uint) (rater principal))
+    (ok (is-some (map-get? project-ratings {project-id: project-id, rater: rater}))))
