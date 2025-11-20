@@ -36,11 +36,21 @@
 (define-constant QUALITY_RATING_REWARD u100)
 (define-constant EXCELLENCE_BONUS u200)
 
+(define-constant ERR_INSURANCE_CLAIM_NOT_FOUND u117)
+(define-constant ERR_INSURANCE_ALREADY_CLAIMED u118)
+(define-constant ERR_INSURANCE_INSUFFICIENT_FUNDS u119)
+(define-constant ERR_INSURANCE_NOT_ELIGIBLE u120)
+(define-constant INSURANCE_CONTRIBUTION_MIN u50000)
+(define-constant INSURANCE_COVERAGE_PERCENTAGE u80)
+(define-constant INSURANCE_PROVIDER_REWARD u30)
+
 (define-data-var next-proposal-id uint u1)
 (define-data-var next-project-id uint u1)
 (define-data-var total-dao-fund uint u0)
 (define-data-var next-dispute-id uint u1)
 (define-data-var next-rating-id uint u1)
+(define-data-var total-insurance-fund uint u0)
+(define-data-var next-insurance-claim-id uint u1)
 
 (define-map dao-members principal uint)
 (define-map member-contributions principal uint)
@@ -130,6 +140,21 @@
     excellence-count: uint,
     total-projects: uint
 })
+
+(define-map insurance-providers principal uint)
+(define-map insurance-claims uint {
+    id: uint,
+    claimant: principal,
+    project-id: uint,
+    milestone-id: uint,
+    dispute-id: uint,
+    amount-requested: uint,
+    amount-paid: uint,
+    claimed: bool,
+    approved: bool,
+    created-at: uint
+})
+(define-map project-insurance-coverage uint bool)
 
 (define-public (join-dao (contribution uint))
     (let ((current-member (default-to u0 (map-get? dao-members tx-sender)))
@@ -522,3 +547,78 @@
 
 (define-read-only (has-rated-project (project-id uint) (rater principal))
     (ok (is-some (map-get? project-ratings {project-id: project-id, rater: rater}))))
+
+(define-public (contribute-to-insurance-fund (amount uint))
+    (let ((current-contribution (default-to u0 (map-get? insurance-providers tx-sender)))
+          (member-status (default-to u0 (map-get? dao-members tx-sender))))
+        (asserts! (> member-status u0) (err ERR_NOT_AUTHORIZED))
+        (asserts! (>= amount INSURANCE_CONTRIBUTION_MIN) (err ERR_INVALID_PROPOSAL))
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set insurance-providers tx-sender (+ current-contribution amount))
+        (var-set total-insurance-fund (+ (var-get total-insurance-fund) amount))
+        (let ((provider-rep (unwrap! (map-get? member-reputation tx-sender) (err ERR_NOT_AUTHORIZED))))
+            (map-set member-reputation tx-sender (merge provider-rep {
+                score: (+ (get score provider-rep) INSURANCE_PROVIDER_REWARD)
+            })))
+        (ok true)))
+
+(define-public (enable-project-insurance (project-id uint))
+    (let ((project (unwrap! (map-get? housing-projects project-id) (err ERR_INVALID_PROPOSAL))))
+        (asserts! (is-eq tx-sender (get contractor project)) (err ERR_NOT_AUTHORIZED))
+        (asserts! (is-none (map-get? project-insurance-coverage project-id)) (err ERR_INVALID_PROPOSAL))
+        (map-set project-insurance-coverage project-id true)
+        (ok true)))
+
+(define-public (file-insurance-claim (project-id uint) (milestone-id uint) (dispute-id uint))
+    (let ((claim-id (var-get next-insurance-claim-id))
+          (dispute (unwrap! (map-get? disputes dispute-id) (err ERR_DISPUTE_NOT_FOUND)))
+          (milestone-key {project-id: project-id, milestone-id: milestone-id})
+          (milestone (unwrap! (map-get? project-milestones milestone-key) (err ERR_MILESTONE_NOT_FOUND)))
+          (project (unwrap! (map-get? housing-projects project-id) (err ERR_INVALID_PROPOSAL)))
+          (is-covered (default-to false (map-get? project-insurance-coverage project-id))))
+        (asserts! is-covered (err ERR_INSURANCE_NOT_ELIGIBLE))
+        (asserts! (is-eq (get project-id dispute) project-id) (err ERR_DISPUTE_NOT_FOUND))
+        (asserts! (is-eq (get milestone-id dispute) milestone-id) (err ERR_DISPUTE_NOT_FOUND))
+        (asserts! (get resolved dispute) (err ERR_DISPUTE_RESOLVED))
+        (asserts! (is-eq (some true) (get ruling dispute)) (err ERR_INSURANCE_NOT_ELIGIBLE))
+        (let ((coverage-amount (/ (* (get amount milestone) INSURANCE_COVERAGE_PERCENTAGE) u100)))
+            (asserts! (>= (var-get total-insurance-fund) coverage-amount) (err ERR_INSURANCE_INSUFFICIENT_FUNDS))
+            (map-set insurance-claims claim-id {
+                id: claim-id,
+                claimant: tx-sender,
+                project-id: project-id,
+                milestone-id: milestone-id,
+                dispute-id: dispute-id,
+                amount-requested: coverage-amount,
+                amount-paid: u0,
+                claimed: false,
+                approved: true,
+                created-at: stacks-block-height
+            })
+            (var-set next-insurance-claim-id (+ claim-id u1))
+            (ok claim-id))))
+
+(define-public (process-insurance-claim (claim-id uint))
+    (let ((claim (unwrap! (map-get? insurance-claims claim-id) (err ERR_INSURANCE_CLAIM_NOT_FOUND))))
+        (asserts! (get approved claim) (err ERR_INSURANCE_NOT_ELIGIBLE))
+        (asserts! (not (get claimed claim)) (err ERR_INSURANCE_ALREADY_CLAIMED))
+        (asserts! (>= (var-get total-insurance-fund) (get amount-requested claim)) (err ERR_INSURANCE_INSUFFICIENT_FUNDS))
+        (try! (as-contract (stx-transfer? (get amount-requested claim) tx-sender (get claimant claim))))
+        (var-set total-insurance-fund (- (var-get total-insurance-fund) (get amount-requested claim)))
+        (map-set insurance-claims claim-id (merge claim {
+            claimed: true,
+            amount-paid: (get amount-requested claim)
+        }))
+        (ok true)))
+
+(define-read-only (get-insurance-fund-balance)
+    (ok (var-get total-insurance-fund)))
+
+(define-read-only (get-provider-contribution (provider principal))
+    (ok (default-to u0 (map-get? insurance-providers provider))))
+
+(define-read-only (get-insurance-claim (claim-id uint))
+    (ok (map-get? insurance-claims claim-id)))
+
+(define-read-only (is-project-insured (project-id uint))
+    (ok (default-to false (map-get? project-insurance-coverage project-id))))
